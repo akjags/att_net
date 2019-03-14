@@ -21,7 +21,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
-m = nn.Upsample(scale_factor=10, mode='nearest')
+m = nn.Upsample(scale_factor=30, mode='nearest')
 
 def image_loader(image_name, imsize = 240):
     """load image, returns cuda tensor"""
@@ -95,7 +95,7 @@ class AttMLP(nn.Module):
         return output
 
 class AttNet(nn.Module):
-    def __init__(self, hidden_size=128, num_classes=576):
+    def __init__(self, hidden_size=128):
         super(AttNet, self).__init__()
         self.hidden_size = hidden_size
 
@@ -104,7 +104,7 @@ class AttNet(nn.Module):
         for param in self.pool4.parameters():
             param.requires_grad = False
 
-        self.mlp = MLP(115200+4, self.hidden_size, num_classes).to(device)
+        self.mlp = MLP(115200+4, self.hidden_size, 64).to(device)
         for param in self.mlp.parameters():
             param.requires_grad = True
         
@@ -127,8 +127,8 @@ class AttNet(nn.Module):
         
         # Get the output of the Multilayer Perceptron (gain)
         mlp_out = self.mlp(cat) # 1 x 240
-        mlp_out = mlp_out.view(1,-1,24,24)
-        mlp_upsmpl = torch.squeeze(m(mlp_out))
+        mlp_out = mlp_out.view(1,-1,8,8)
+        mlp_upsmpl = torch.squeeze(m(mlp_out)) # Upsample the image to 240 x 240
         gain_map = torch.stack((mlp_upsmpl,)*64, dim=0).transpose(0,1)
         
         # Multiply by the output of conv1 
@@ -151,7 +151,7 @@ class ImageFolderEX(ImageFolder):
             img, label = None, None
         return [img, label]
 
-def train_AttNet(test_data, savedir = '/scratch/users/akshayj/log002', n_epochs=10):
+def train_AttNet(test_data, savedir = '/scratch/users/akshayj/log002', n_epochs=50):
     hidden_size = 128
     num_classes = 576
     batch_size = 50
@@ -163,7 +163,7 @@ def train_AttNet(test_data, savedir = '/scratch/users/akshayj/log002', n_epochs=
 
     # Load data
     stimdir = '/scratch/users/akshayj/att_net_stimuli/'
-    train_dataset = ImageFolderEX(stimdir, loader=image_loader)
+    train_dataset = ImageFolder(stimdir, loader=image_loader)
     train_data_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     # Get test data
@@ -177,50 +177,53 @@ def train_AttNet(test_data, savedir = '/scratch/users/akshayj/log002', n_epochs=
     train_losses = np.zeros((n_epochs, len(train_data_loader))) # For plotting
     test_losses  = np.zeros((n_epochs, len(train_data_loader)))
     for epoch in range(n_epochs):
-        
-        for step, (x,y) in enumerate(train_data_loader):
-            if x is None:
-                print 'IO Error caught: Skipping image on step {}'.format(step)
-                continue
-            b_x = Variable(torch.squeeze(x)).to(device)
-            
-            # Turn Y vector into one-hot
-            b_y = torch.fmod(y,4).unsqueeze(1).to(device)
-            y_1hot = torch.FloatTensor(y.shape[0], 4).zero_().to(device)
-            y_1hot.scatter_(1, b_y, 1)
-            del b_y
+        try:
+            for step, (x,y) in enumerate(train_data_loader):
+                if x is None:
+                    print 'IO Error caught: Skipping image on step {}'.format(step)
+                    continue
+                b_x = Variable(torch.squeeze(x)).to(device)
 
-            # Extract hidden unit initialization and turn into one-hot
-            hid = torch.div(y,4).unsqueeze(1).to(device);
-            hid_1hot = torch.FloatTensor(hid.shape[0], 4).zero_().to(device)    
-            hid_1hot.scatter_(1, hid, 1)
-            hid_1hot = hid_1hot.unsqueeze(0)
-            del hid
-            
-            # Get training loss.
-            optimizer.zero_grad()
-            output = model(b_x, hid_1hot)
-            loss = loss_func(output, y_1hot)
+                # Turn Y vector into one-hot
+                b_y = torch.fmod(y,4).unsqueeze(1).to(device)
+                y_1hot = torch.FloatTensor(y.shape[0], 4).zero_().to(device)
+                y_1hot.scatter_(1, b_y, 1)
+                del b_y
 
-            # Propagate
-            loss.backward()
-            optimizer.step()
+                # Extract hidden unit initialization and turn into one-hot
+                hid = torch.div(y,4).unsqueeze(1).to(device);
+                hid_1hot = torch.FloatTensor(hid.shape[0], 4).zero_().to(device)    
+                hid_1hot.scatter_(1, hid, 1)
+                hid_1hot = hid_1hot.unsqueeze(0)
+                del hid
 
-            # Save training loss
-            train_losses[epoch, step] = loss.item()
-            torch.cuda.empty_cache()
-            if step % test_freq == 0:
-                # Get test loss.
-                with torch.no_grad():
-                    output = model(x_test, query_test)
-                    test_loss = loss_func(output, y_test)
-                    #print epoch, step, test_losses, test_loss.item()
+                # Get training loss.
+                optimizer.zero_grad()
+                output = model(b_x, hid_1hot)
+                loss = loss_func(output, y_1hot)
 
-                test_losses[epoch, step] = test_loss.item()
-                save_dict = {'epoch': epoch, 'step': step, 'train_loss':train_losses, 'test_loss': test_losses}
-                np.save(savedir+'/epoch{}_step{}.npy'.format(epoch, step), save_dict);
-                print '---Epoch {}, Step {}: Train Loss = {}; Test Loss = {} ---'.format(epoch, step, 
-                                                               train_losses[epoch,step], test_losses[epoch,step])
+                # Propagate
+                loss.backward()
+                optimizer.step()
+
+                # Save training loss
+                train_losses[epoch, step] = loss.item()
+                torch.cuda.empty_cache()
+                if step % test_freq == 0:
+                    # Get test loss.
+                    with torch.no_grad():
+                        output = model(x_test, query_test)
+                        test_loss = loss_func(output, y_test)
+                        #print epoch, step, test_losses, test_loss.item()
+
+                    test_losses[epoch, step] = test_loss.item()
+                    save_dict = {'epoch': epoch, 'step': step, 'train_loss':train_losses, 'test_loss': test_losses}
+                    np.save(savedir+'/epoch{}_step{}.npy'.format(epoch, step), save_dict);
+                    print '---Epoch {}, Step {}: Train Loss = {}; Test Loss = {} ---'.format(epoch, step, 
+                                                                   train_losses[epoch,step], test_losses[epoch,step])
+        except:
+            print('Failure!!! Skipping to next epoch.')
+            continue
 
             
         
